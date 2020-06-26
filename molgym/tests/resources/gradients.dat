@@ -1,0 +1,18 @@
+# SPARROW, command-line program
+# Host: gabriel
+# Start: Fri Oct 18 18:26:07 2019
+# 
+# Program call:  sparrow --molecular_charge 0 --spin_multiplicity 1 --method PM6 --unrestricted_calculation --structure h2o.xyz --gradients --output_to_file
+# Method:                  PM6
+# Calculation Modus:       Spin-unrestricted formalism
+# Molecular charge:        0
+# Spin multiplicity:       1
+# Convergence threshold:   1.000000e-05 hartree
+# Max Iterations:          100
+# Convergence accelerator: diis
+# Parameters:              /home/gregor/local/sparrow-1.0.0-gcc-9.2.1/resources/Parameters/Pm6/parameters.xml
+# 
+# Gradients [hartree/bohr]:
+-8.700857e-03 -1.502556e-02 5.081632e-03 
+-4.048210e-03 1.437334e-02  3.364464e-03 
+1.274907e-02  6.522202e-04  -8.446095e-03
