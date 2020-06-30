@@ -4,7 +4,7 @@
 
 **Reinforcement Learning for Molecular Design Guided by Quantum Mechanics**<br>
 Gregor N. C. Simm, Robert Pinsler and José Miguel Hernández-Lobato <br>
-*Proceedings of the 37th International Conference on Machine Learning*, Vienna, Austria, PMLR 108, 2020.<br>
+*Proceedings of the 37th International Conference on Machine Learning*, Vienna, Austria, PMLR 119, 2020.<br>
 https://arxiv.org/abs/2002.07717
 
 The code has been authored by: Gregor N. C. Simm and Robert Pinsler.
