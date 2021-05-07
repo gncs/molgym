@@ -4,7 +4,7 @@ import ase.data
 import ase.io
 
 from molgym.env_container import SimpleEnvContainer
-from molgym.environment import MolecularEnvironment
+from molgym.environment import StochasticEnvironment, MolecularEnvironment
 from molgym.ppo import batch_ppo
 from molgym.reward import InteractionReward
 from molgym.spaces import ActionSpace, ObservationSpace
@@ -15,6 +15,7 @@ from molgym.tools.model_util import ModelIO, build_model
 
 def get_config() -> dict:
     parser = build_default_argparser()
+    parser.add_argument('--size_range', help='minimum and maximum bag size (comma-separated)', type=str, required=True)
     args = parser.parse_args()
     config = vars(args)
     return config
@@ -40,25 +41,22 @@ def main() -> None:
     if not config['eval_formulas']:
         config['eval_formulas'] = config['formulas']
 
-    train_formulas = util.split_formula_strings(config['formulas'])
+    train_formula = util.split_formula_strings(config['formulas'])[0]
     eval_formulas = util.split_formula_strings(config['eval_formulas'])
+    size_range = util.parse_size_range(config['size_range'])
 
-    logging.info(f'Training bags: {train_formulas}')
-    logging.info(f'Evaluation bags: {eval_formulas}')
+    logging.info(f'Statistical training bag: {train_formula}, size range: {size_range}')
+    logging.info(f'Evaluation bag(s): {eval_formulas}')
 
     model_handler = ModelIO(directory=config['model_dir'], tag=tag, keep=config['keep_models'])
 
-    if config['load_latest']:
+    start_num_steps = 0
+    if not config['load_latest']:
+        model = build_model(config, observation_space=observation_space, action_space=action_space, device=device)
+    else:
         model, start_num_steps = model_handler.load_latest(device=device)
         model.action_space = action_space
         model.observation_space = observation_space
-    elif config['load_model'] is not None:
-        model, start_num_steps = model_handler.load(device=device, path=config['load_model'])
-        model.action_space = action_space
-        model.observation_space = observation_space
-    else:
-        model = build_model(config, observation_space=observation_space, action_space=action_space, device=device)
-        start_num_steps = 0
 
     var_counts = util.count_vars(model)
     logging.info(f'Number of parameters: {var_counts}')
@@ -70,11 +68,12 @@ def main() -> None:
         config['num_eval_episodes'] = len(eval_formulas)
 
     training_envs = SimpleEnvContainer([
-        MolecularEnvironment(
+        StochasticEnvironment(
             reward=reward,
             observation_space=observation_space,
             action_space=action_space,
-            formulas=[util.string_to_formula(f) for f in train_formulas],
+            formula=util.string_to_formula(train_formula),
+            size_range=size_range,
             min_atomic_distance=config['min_atomic_distance'],
             max_solo_distance=config['max_solo_distance'],
             min_reward=config['min_reward'],
@@ -86,7 +85,7 @@ def main() -> None:
             reward=reward,
             observation_space=observation_space,
             action_space=action_space,
-            formulas=[util.string_to_formula(f) for f in eval_formulas],
+            formulas=[util.string_to_formula(formula) for formula in eval_formulas],
             min_atomic_distance=config['min_atomic_distance'],
             max_solo_distance=config['max_solo_distance'],
             min_reward=config['min_reward'],

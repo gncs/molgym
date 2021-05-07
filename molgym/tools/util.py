@@ -1,24 +1,47 @@
+import collections
 import json
 import logging
 import os
 import pickle
 import sys
-from typing import Optional, List, Tuple
+from typing import Optional, List, Iterable, Tuple, Dict
 
+import ase.data
 import ase.formula
 import numpy as np
 import scipy.signal
 import torch
 from ase.formula import Formula
+from torch.optim import Adam
+from torch.optim.optimizer import Optimizer
 
-from molgym.agents.base import AbstractActorCritic
-from molgym.tools import mpi
+from molgym.spaces import FormulaType
 
 
-def remove_from_formula(formula: Formula, symbol: str) -> Formula:
-    d = formula.count()
-    d[symbol] -= 1
-    return Formula.from_dict(d)
+def string_to_formula(string: str) -> FormulaType:
+    d = Formula(string).count().items()
+    return tuple((ase.data.atomic_numbers[symbol], count) for symbol, count in d)
+
+
+def zs_to_formula(zs: List[int]) -> FormulaType:
+    counter: Dict[int, int] = collections.Counter()
+    for z in zs:
+        counter[z] += 1
+    return tuple(counter.items())
+
+
+def remove_atom_from_formula(formula: FormulaType, atomic_number: int) -> FormulaType:
+    copy = list(formula)
+    for i, (z, count) in enumerate(formula):
+        if z == atomic_number and count >= 1:
+            copy[i] = (z, count - 1)
+            return tuple(copy)
+
+    raise RuntimeError(f"Could not remove atomic number {atomic_number} from bag {formula}")
+
+
+def get_formula_size(formula: FormulaType) -> int:
+    return sum(count for z, count in formula)
 
 
 def to_numpy(t: torch.Tensor) -> np.ndarray:
@@ -33,6 +56,17 @@ def combined_shape(length: int, shape: Optional[tuple] = None) -> tuple:
 
 def count_vars(module: torch.nn.Module) -> int:
     return sum(np.prod(p.shape) for p in module.parameters())
+
+
+def compute_gradient_norm(parameters: Iterable[torch.nn.Parameter], norm_type: int = 2) -> float:
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    if len(parameters) == 0:
+        return 0.0
+    device = parameters[0].grad.device  # type: ignore
+    total_norm = torch.norm(
+        torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]),  # type: ignore
+        norm_type)
+    return total_norm.item()
 
 
 def discount_cumsum(x: np.ndarray, discount: float) -> np.ndarray:
@@ -53,20 +87,19 @@ def discount_cumsum(x: np.ndarray, discount: float) -> np.ndarray:
     return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 
-def set_one_thread():
-    # Avoid certain slowdowns from PyTorch + MPI combo.
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
-
-
 def set_seeds(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def parse_formulas(formulas: str) -> List[ase.formula.Formula]:
-    return [ase.formula.Formula(s.strip()) for s in formulas.split(',')]
+def split_formula_strings(formulas: str) -> List[str]:
+    return formulas.split(',')
+
+
+def parse_size_range(size_range: str) -> Tuple[int, int]:
+    parsed_range = [int(i) for i in size_range.split(',')]
+    assert len(parsed_range) == 2
+    return parsed_range[0], parsed_range[1]
 
 
 def get_tag(config: dict) -> str:
@@ -74,9 +107,6 @@ def get_tag(config: dict) -> str:
 
 
 def save_config(config: dict, directory: str, tag: str, verbose=True):
-    if not mpi.is_main_proc():
-        return
-
     formatted = json.dumps(config, indent=4, sort_keys=True)
 
     if verbose:
@@ -94,32 +124,22 @@ def create_directories(directories: List[str]):
 
 def setup_logger(config: dict, directory, tag: str):
     logger = logging.getLogger()
+    logger.setLevel(config['log_level'])
 
-    if not mpi.is_main_proc() and not config['all_ranks']:
-        # Set level to a something higher than logging.CRITICAL to silence all messages
-        logger.setLevel(logging.CRITICAL + 1)
-    else:
-        logger.setLevel(config['log_level'])
-
-    name = ''
-    if mpi.get_num_procs() > 1:
-        name = f'rank[{mpi.get_proc_rank()}] '
-
-    formatter = logging.Formatter('%(asctime)s.%(msecs)03d ' + name + '%(levelname)s: %(message)s',
-                                  datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
     ch = logging.StreamHandler(stream=sys.stdout)
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
     path = os.path.join(directory, tag + '.log')
-    fh = mpi.MPIFileHandler(path)
+    fh = logging.FileHandler(path)
     fh.setFormatter(formatter)
 
     logger.addHandler(fh)
 
 
-def setup_simple_logger(path: str, log_level=logging.INFO):
+def setup_simple_logger(path: str = None, log_level=logging.INFO):
     logger = logging.getLogger()
     logger.setLevel(log_level)
     formatter = logging.Formatter('%(message)s')
@@ -128,65 +148,20 @@ def setup_simple_logger(path: str, log_level=logging.INFO):
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-    fh = logging.FileHandler(path, mode='w')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-
-class ModelIO:
-    def __init__(self, directory: str, tag: str) -> None:
-        self.directory = directory
-        self.root_name = tag
-        self._suffix = '.model'
-        self._iter_suffix = '.txt'
-
-    def _get_model_path(self) -> str:
-        return os.path.join(self.directory, self.root_name + self._suffix)
-
-    def _get_info_path(self) -> str:
-        return os.path.join(self.directory, self.root_name + self._iter_suffix)
-
-    def save(self, module: AbstractActorCritic, num_steps: int):
-        if not mpi.is_main_proc():
-            return
-
-        # Save model
-        model_path = self._get_model_path()
-        logging.debug(f'Saving model: {model_path}')
-        torch.save(obj=module, f=model_path)
-
-        # Save iteration
-        info_path = self._get_info_path()
-        with open(info_path, mode='w') as f:
-            f.write(str(num_steps))
-
-    def load(self) -> Tuple[AbstractActorCritic, int]:
-        # Load model
-        model_path = self._get_model_path()
-        logging.info(f'Loading model: {model_path}')
-        model = torch.load(f=model_path)
-
-        # Load number of steps
-        info_path = self._get_info_path()
-        with open(info_path, mode='r') as f:
-            num_steps = int(f.read())
-
-        return model, num_steps
+    if path:
+        fh = logging.FileHandler(path, mode='w')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
 
 
 class RolloutSaver:
-    def __init__(self, directory: str, tag: str, all_ranks=False):
+    def __init__(self, directory: str, tag: str):
         self.directory = directory
         self.tag = tag
         self._suffix = '.pkl'
 
-        self.all_ranks = all_ranks
-
     def save(self, obj: object, num_steps: int, info: str):
-        if not self.all_ranks and not mpi.is_main_proc():
-            return
-
-        added = f'steps-{num_steps}_rank-{mpi.get_proc_rank()}'
+        added = f'steps-{num_steps}'
 
         path = os.path.join(self.directory, self.tag + '_' + added + '_' + info + self._suffix)
         logging.debug(f'Saving rollout: {path}')
@@ -201,11 +176,30 @@ class InfoSaver:
         self._suffix = '.txt'
 
     def save(self, obj: object, name: str):
-        if not mpi.is_main_proc():
-            return
-
         path = os.path.join(self.directory, self.tag + '_' + name + self._suffix)
         logging.debug(f'Saving info: {path}')
         with open(path, mode='a') as f:
             f.write(json.dumps(obj))
             f.write('\n')
+
+
+def init_device(device_str: str) -> torch.device:
+    if device_str == 'cuda':
+        assert (torch.cuda.is_available()), 'No CUDA device available!'
+        logging.info('CUDA Device: {}'.format(torch.cuda.current_device()))
+        torch.cuda.init()
+        return torch.device('cuda')
+    else:
+        logging.info('Using CPU')
+        return torch.device('cpu')
+
+
+def get_optimizer(name: str, learning_rate: float, parameters: Iterable[torch.Tensor]) -> Optimizer:
+    if name == 'adam':
+        amsgrad = False
+    elif name == 'amsgrad':
+        amsgrad = True
+    else:
+        raise RuntimeError(f"Unknown optimizer '{name}'")
+
+    return Adam(parameters, lr=learning_rate, amsgrad=amsgrad)

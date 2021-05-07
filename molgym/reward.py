@@ -3,6 +3,7 @@ import time
 from typing import Tuple, Dict
 
 import ase.data
+import numpy as np
 from ase import Atoms, Atom
 
 from molgym.calculator import Sparrow
@@ -20,6 +21,8 @@ class MolecularReward(abc.ABC):
 
 class InteractionReward(MolecularReward):
     def __init__(self) -> None:
+        # Due to some mysterious bug in Sparrow, calculations get slower and slower over time.
+        # Therefore, we generate a new Sparrow object every time.
         self.calculator = Sparrow('PM6')
 
         self.settings = {
@@ -32,6 +35,7 @@ class InteractionReward(MolecularReward):
 
     def calculate(self, atoms: Atoms, new_atom: Atom) -> Tuple[float, dict]:
         start = time.time()
+        self.calculator = Sparrow('PM6')
 
         all_atoms = atoms.copy()
         all_atoms.append(new_atom)
@@ -66,3 +70,31 @@ class InteractionReward(MolecularReward):
         self.settings['spin_multiplicity'] = self.get_minimum_spin_multiplicity(atoms)
         self.calculator.set_settings(self.settings)
         return self.calculator.calculate_energy()
+
+
+class SolvationReward(InteractionReward):
+    def __init__(self, distance_penalty=0.01) -> None:
+        super().__init__()
+
+        self.distance_penalty = distance_penalty
+
+    def calculate(self, atoms: Atoms, new_atom: Atom) -> Tuple[float, dict]:
+        start_time = time.time()
+        self.calculator = Sparrow('PM6')
+
+        all_atoms = atoms.copy()
+        all_atoms.append(new_atom)
+
+        e_tot = self._calculate_energy(all_atoms)
+        e_parts = self._calculate_energy(atoms) + self._calculate_atomic_energy(new_atom)
+        delta_e = e_tot - e_parts
+
+        distance = np.linalg.norm(new_atom.position)
+
+        reward = -1 * (delta_e + self.distance_penalty * distance)
+
+        info = {
+            'elapsed_time': time.time() - start_time,
+        }
+
+        return reward, info

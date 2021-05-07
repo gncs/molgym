@@ -1,8 +1,11 @@
+from typing import Tuple
+
 import torch
 import torch.distributions
+import torch_scatter
 
 
-def to_one_hot(indices: torch.Tensor, num_classes: int, device=torch.device('cpu')) -> torch.Tensor:
+def to_one_hot(indices: torch.Tensor, num_classes: int, device=None) -> torch.Tensor:
     """
     Generates one-hot encoding with <num_classes> classes from <indices>
 
@@ -21,19 +24,7 @@ def to_one_hot(indices: torch.Tensor, num_classes: int, device=torch.device('cpu
 
 
 def masked_softmax(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the masked softmax from logits.
-
-    :param logits: (N x ... x K) tensor
-    :param mask: (N x ... x K) tensor
-    :return: (N x ... x K) tensor
-    """
-    maxima, _ = torch.max(logits, dim=-1, keepdim=True)
-    exps = torch.exp(logits - maxima)
-
-    # Note: in-place operator must not be used here!
-    exps = exps * mask
-    return exps / torch.sum(exps, keepdim=True, dim=-1)
+    return torch_scatter.composite.scatter_softmax(src=logits, index=mask.to(torch.long), dim=-1) * mask
 
 
 def init_layer(layer: torch.nn.Linear, w_scale=1.0) -> torch.nn.Linear:
@@ -44,16 +35,16 @@ def init_layer(layer: torch.nn.Linear, w_scale=1.0) -> torch.nn.Linear:
 
 
 class MLP(torch.nn.Module):
-    def __init__(self, input_dim: int, hidden_units=(64, 64), gate=torch.nn.functional.relu):
+    def __init__(self, input_dim: int, output_dims: Tuple[int, ...] = (64, 64), gate=torch.nn.functional.relu):
         super().__init__()
-        dims = (input_dim, ) + hidden_units
+        dims = (input_dim, ) + output_dims
         self.layers = torch.nn.ModuleList(
             [init_layer(torch.nn.Linear(dim_in, dim_out)) for dim_in, dim_out in zip(dims[:-1], dims[1:])])
         self.gate = gate
         self.output_dim = dims[-1]
 
     def forward(self, x):
-        for layer in self.layers[:1]:
+        for layer in self.layers[:-1]:
             x = self.gate(layer(x))
         x = self.layers[-1](x)
         return x

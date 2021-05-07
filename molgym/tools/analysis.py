@@ -14,7 +14,7 @@ def parse_json_lines_file(path: str) -> List[dict]:
 
 
 def parse_buffer_filename(filename: str) -> dict:
-    regex = re.compile(fr'(?P<name>.*?)_run-(?P<seed>\d+)_steps-(?P<steps>\d+)_rank-(?P<rank>\d+)_(?P<mode>.*?)\.pkl')
+    regex = re.compile(r'(?P<name>.*?)_run-(?P<seed>\d+)_steps-(?P<steps>\d+)(_rank-(?P<rank>\d+))?_(?P<mode>.*?)\.pkl')
     match = regex.match(filename)
     if not match:
         raise RuntimeError(f'Cannot parse filename: {filename}')
@@ -22,13 +22,13 @@ def parse_buffer_filename(filename: str) -> dict:
         'name': match.group('name'),
         'seed': int(match.group('seed')),
         'steps': int(match.group('steps')),
-        'rank': int(match.group('rank')),
+        'rank': int(match.group('rank')) if match.group('rank') else 0,
         'mode': match.group('mode'),
     }
 
 
 def parse_results_filename(filename: str) -> dict:
-    regex = re.compile(fr'(?P<name>.*?)_run-(?P<seed>\d+)_(?P<mode>.*?)\.txt')
+    regex = re.compile(r'(?P<name>.*?)_run-(?P<seed>\d+)_(?P<mode>.*?)\.txt')
     match = regex.match(filename)
     if not match:
         raise RuntimeError(f'Cannot parse filename: {filename}')

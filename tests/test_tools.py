@@ -1,26 +1,20 @@
 from unittest import TestCase
 
 import numpy as np
-from ase.formula import Formula
 
-from molgym.tools.util import remove_from_formula, discount_cumsum, parse_formulas
+from molgym.tools.util import discount_cumsum, split_formula_strings, zs_to_formula
 
 
 class TestTools(TestCase):
-    def test_formula(self):
-        f = Formula('HCO')
-        f2 = remove_from_formula(f, 'H')
-
-        self.assertEqual(f2.count()['H'], 0)
-
-        with self.assertRaises(KeyError):
-            remove_from_formula(f, 'He')
-
     def test_parse_formula(self):
         s = 'H2O, CH4, O2'
-        formulas = parse_formulas(s)
+        formulas = split_formula_strings(s)
 
         self.assertEqual(len(formulas), 3)
+
+    def test_zs_to_formula(self):
+        formula = zs_to_formula([1, 1, 2, 4])
+        self.assertEqual(len(formula), 3)
 
     def test_cumsum(self):
         discount = 0.5

@@ -4,7 +4,7 @@ from unittest import TestCase
 import ase.io
 import numpy as np
 
-from molgym.tools.zmat import get_distance, get_angle, get_dihedral, position_point
+from molgym.agents.internal.zmat import get_distance, get_angle, get_dihedral, position_point
 
 
 class TestZMat(TestCase):

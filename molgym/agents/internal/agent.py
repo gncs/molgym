@@ -1,19 +1,20 @@
 from typing import Tuple, List, Optional
 
 import ase
+import ase.data
 import numpy as np
 import schnetpack as spk
 import torch
 import torch.distributions
 
 from molgym.agents.base import AbstractActorCritic
+from molgym.agents.internal import zmat
 from molgym.modules import MLP, masked_softmax, to_one_hot
 from molgym.spaces import ObservationSpace, ObservationType, ActionType, ActionSpace
-from molgym.tools import zmat
 from molgym.tools.util import to_numpy
 
 
-class InternalAC(AbstractActorCritic):
+class SchNetAC(AbstractActorCritic):
     def __init__(
         self,
         observation_space: ObservationSpace,
@@ -23,7 +24,7 @@ class InternalAC(AbstractActorCritic):
         device: torch.device,
     ):
         # Internal action: stop, focus, element, distance, angle, dihedral, kappa
-        super().__init__(observation_space=observation_space, action_space=action_space, internal_action_dim=7)
+        super().__init__(observation_space=observation_space, action_space=action_space)
         self.device = device
 
         self.num_atoms = self.observation_space.canvas_space.size
@@ -38,27 +39,27 @@ class InternalAC(AbstractActorCritic):
 
         self.phi_beta = MLP(
             input_dim=self.num_zs,
-            hidden_units=(network_width, self.num_latent_beta),
+            output_dims=(network_width, self.num_latent_beta),
         )
 
         self.phi_focus = MLP(
             input_dim=self.num_latent,
-            hidden_units=(network_width, 1),
+            output_dims=(network_width, 1),
         )
 
         self.phi_element = MLP(
             input_dim=self.num_latent,
-            hidden_units=(network_width, self.num_zs),
+            output_dims=(network_width, self.num_zs),
         )
 
         self.phi_continuous = MLP(
             input_dim=(self.num_latent + self.num_zs),
-            hidden_units=(network_width, 3),
+            output_dims=(network_width, 3),
         )
 
         self.phi_kappa = MLP(
             input_dim=self.num_latent,
-            hidden_units=(network_width, 1),
+            output_dims=(network_width, 1),
         )
 
         self.log_stds = torch.nn.Parameter(torch.log(torch.tensor([0.15, 0.25, 0.25], dtype=torch.float32)),
@@ -82,14 +83,13 @@ class InternalAC(AbstractActorCritic):
 
         self.critic = MLP(
             input_dim=self.num_latent,
-            hidden_units=(network_width, network_width, 1),
+            output_dims=(network_width, network_width, 1),
         )
 
         self.to(device)
 
-    def to_action_space(self, action: np.ndarray, observation: ObservationType) -> ActionType:
-        assert action.shape[0] == self.internal_action_dim
-        stop, focus, element, distance, angle, dihedral, kappa = action
+    def to_action_space(self, action: torch.Tensor, observation: ObservationType) -> ActionType:
+        stop, focus, element, distance, angle, dihedral, kappa = to_numpy(action)
 
         if stop:
             return self.action_space.build(ase.Atoms())
@@ -99,15 +99,15 @@ class InternalAC(AbstractActorCritic):
         element = int(round(element))
         sign = -1 if int(round(kappa)) else 1
 
-        atoms, _ = self.observation_space.parse(observation)
+        atoms, bag = self.observation_space.parse(observation)
         positions = [atom.position for atom in atoms]
-        new_position = zmat.position_atom_helper(positions=positions,
-                                                 focus=focus,
-                                                 distance=distance,
-                                                 angle=angle,
-                                                 dihedral=sign * dihedral)
-        new_atom = ase.Atom(symbol=self.observation_space.bag_space.get_symbol(element), position=new_position)
-        return self.action_space.from_atom(new_atom)
+        position = zmat.position_atom_helper(positions=positions,
+                                             focus=focus,
+                                             distance=distance,
+                                             angle=angle,
+                                             dihedral=sign * dihedral)
+        atomic_number_index = self.action_space.zs.index(self.observation_space.bag_space.zs[element])
+        return atomic_number_index, tuple(position)
 
     def make_atomic_tensors(
         self, observations: List[ObservationType]
@@ -122,8 +122,8 @@ class InternalAC(AbstractActorCritic):
         action_mask = torch.zeros(size=(len(observations), 6), dtype=torch.float32, device=self.device)
 
         for i, observation in enumerate(observations):
-            atoms, bag = self.observation_space.parse(observation)
-            bag_tuple = self.observation_space.bag_space.from_formula(bag)
+            atoms, formula = self.observation_space.parse(observation)
+            bag_tuple = [count for atomic_num, count in formula]
             if len(atoms) > 0:
                 features[i, :len(atoms), :] = self.embedding_fn(self.converter(atoms))
                 focus_mask[i, :len(atoms)] = 1
@@ -161,7 +161,7 @@ class InternalAC(AbstractActorCritic):
         dihedral = to_numpy(dihedral)
 
         for i, observation in enumerate(observations):
-            atoms, _ = self.observation_space.parse(observation)
+            atoms, bag = self.observation_space.parse(observation)
             positions = [atom.position for atom in atoms]
             new_position = zmat.position_atom_helper(
                 positions=positions,
@@ -171,13 +171,14 @@ class InternalAC(AbstractActorCritic):
                 dihedral=dihedral[i, 0],
             )
             new_element = int(round(element[i, 0]))
-            new_atom = ase.Atom(symbol=self.observation_space.bag_space.get_symbol(new_element), position=new_position)
+            atomic_number = bag[new_element][0]
+            new_atom = ase.Atom(symbol=ase.data.chemical_symbols[atomic_number], position=new_position)
             atoms.append(new_atom)
             features[i] = self.embedding_fn(self.converter(atoms))[:, -1, :]
 
         return features
 
-    def step(self, observations: List[ObservationType], action: Optional[np.ndarray] = None) -> dict:
+    def step(self, observations: List[ObservationType], actions: Optional[np.ndarray] = None) -> dict:
         # atomic_feats: n_obs x n_atoms x n_afeats
         # focus_mask: n_obs x n_atoms
         # focus_mask: n_obs x n_atoms
@@ -202,40 +203,40 @@ class InternalAC(AbstractActorCritic):
         focus_logits = self.phi_focus(latent_states)  # n_obs x n_atoms x 1
         focus_logits = focus_logits.squeeze(-1)  # n_obs x n_atoms
 
-        focus_p = masked_softmax(focus_logits, mask=focus_mask)  # n_obs x n_atoms
+        focus_p = masked_softmax(focus_logits, mask=focus_mask.bool())  # n_obs x n_atoms
         focus_dist = torch.distributions.Categorical(probs=focus_p)
 
         # Cast action to Tensor
-        if action is not None:
-            action = torch.as_tensor(action, device=self.device)
+        if actions is not None:
+            actions = torch.as_tensor(actions, device=self.device)
 
         # focus: n_obs x 1
-        if action is not None:
-            focus = torch.round(action[:, 1:2]).long()
+        if actions is not None:
+            focus = torch.round(actions[:, 1:2]).long()
         elif self.training:
             focus = focus_dist.sample().unsqueeze(-1)
         else:
             focus = torch.argmax(focus_p, dim=-1).unsqueeze(-1)
 
-        focus_oh = to_one_hot(focus, num_classes=self.num_atoms)  # n_obs x n_atoms
+        focus_oh = to_one_hot(focus, num_classes=self.num_atoms, device=self.device)  # n_obs x n_atoms
 
         # Focused atom is a hard (one-hot) selection over atoms
         focused_atom = (latent_states.transpose(1, 2) @ focus_oh[:, :, None]).squeeze(-1)  # n_obs x n_latent
 
         # Element
         element_logits = self.phi_element(focused_atom)  # n_obs x n_zs
-        element_p = masked_softmax(element_logits, mask=element_mask)  # n_obs x n_zs
+        element_p = masked_softmax(element_logits, mask=element_mask.bool())  # n_obs x n_zs
         element_dist = torch.distributions.Categorical(probs=element_p)
 
         # element: n_obs x 1
-        if action is not None:
-            element = torch.round(action[:, 2:3]).long()
+        if actions is not None:
+            element = torch.round(actions[:, 2:3]).long()
         elif self.training:
             element = element_dist.sample().unsqueeze(-1)
         else:
             element = torch.argmax(element_p, dim=-1).unsqueeze(-1)
 
-        element_oh = to_one_hot(element, self.num_zs)  # n_obs x n_zs
+        element_oh = to_one_hot(element, self.num_zs, device=self.device)  # n_obs x n_zs
 
         # Continuous variables
         # f: n_obs x (n_latent + n_zs)
@@ -247,8 +248,8 @@ class InternalAC(AbstractActorCritic):
         distance_dist = torch.distributions.Normal(loc=distance_mean, scale=torch.exp(1e-6 + self.log_stds[0]))
 
         # distance: n_obs x 1
-        if action is not None:
-            distance = action[:, 3:4]
+        if actions is not None:
+            distance = actions[:, 3:4]
         elif self.training:
             # Ensure that the sampled distance is > 0
             distance = distance_dist.sample().clamp(0.001)
@@ -260,8 +261,8 @@ class InternalAC(AbstractActorCritic):
         angle_dist = torch.distributions.Normal(loc=angle_mean, scale=torch.exp(1e-6 + self.log_stds[1]))
 
         # angle: n_obs x 1
-        if action is not None:
-            angle = action[:, 4:5]
+        if actions is not None:
+            angle = actions[:, 4:5]
         elif self.training:
             angle = angle_dist.sample()
         else:
@@ -272,8 +273,8 @@ class InternalAC(AbstractActorCritic):
         dihedral_dist = torch.distributions.Normal(loc=dihedral_mean, scale=torch.exp(1e-6 + self.log_stds[2]))
 
         # dihedral: n_obs x 1
-        if action is not None:
-            dihedral = action[:, 5:6]
+        if actions is not None:
+            dihedral = actions[:, 5:6]
         elif self.training:
             dihedral = dihedral_dist.sample()
         else:
@@ -294,15 +295,17 @@ class InternalAC(AbstractActorCritic):
         kappa_dist = torch.distributions.Categorical(logits=kappa_logits)
 
         # kappa: n_obs x 1
-        if action is not None:
-            kappa = torch.round(action[:, 6:7])
+        if actions is not None:
+            kappa = torch.round(actions[:, 6:7])
         elif self.training:
             kappa = kappa_dist.sample().unsqueeze(-1)
         else:
             kappa = torch.argmax(kappa_logits, dim=-1).unsqueeze(-1)
 
-        if action is None:
-            action = torch.cat([stop, focus.float(), element.float(), distance, angle, dihedral, kappa.float()], dim=-1)
+        if actions is None:
+            actions = torch.cat(
+                [stop, focus.float(), element.float(), distance, angle, dihedral,
+                 kappa.float()], dim=-1)
 
         # Critic
         weights = focus_mask.unsqueeze(-1).float()  # n_obs x n_atoms x 1
@@ -340,11 +343,11 @@ class InternalAC(AbstractActorCritic):
         entropy = entropy * action_mask
 
         return {
-            'a': action,  # n_obs x n_subactions
+            'a': actions,  # n_obs x n_subactions
             'logp': log_prob.sum(dim=-1, keepdim=False),  # n_obs
             'ent': entropy[:, 0:2].sum(dim=-1, keepdim=False),  # n_obs
             'v': v.squeeze(-1),  # n_obs
 
-            # Other
-            'entropies': entropy,  # n_obs x n_entropies
+            # Actions in action space
+            'actions': [self.to_action_space(a, o) for a, o in zip(actions, observations)],
         }

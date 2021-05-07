@@ -4,9 +4,9 @@ import ase.data
 import ase.io
 
 from molgym.env_container import SimpleEnvContainer
-from molgym.environment import MolecularEnvironment
+from molgym.environment import RefillableMolecularEnvironment
 from molgym.ppo import batch_ppo
-from molgym.reward import InteractionReward
+from molgym.reward import SolvationReward
 from molgym.spaces import ActionSpace, ObservationSpace
 from molgym.tools import util
 from molgym.tools.arg_parser import build_default_argparser
@@ -15,6 +15,12 @@ from molgym.tools.model_util import ModelIO, build_model
 
 def get_config() -> dict:
     parser = build_default_argparser()
+    parser.add_argument('--num_refills',
+                        help='number of times the bag gets refilled by the environment',
+                        type=int,
+                        required=False,
+                        default=0)
+    parser.add_argument('--initial_structure', help='path to initial structure', type=str, required=False)
     args = parser.parse_args()
     config = vars(args)
     return config
@@ -63,18 +69,25 @@ def main() -> None:
     var_counts = util.count_vars(model)
     logging.info(f'Number of parameters: {var_counts}')
 
-    reward = InteractionReward()
+    reward = SolvationReward()
 
     # Number of episodes during evaluation
     if not config['num_eval_episodes']:
         config['num_eval_episodes'] = len(eval_formulas)
 
+    if config['initial_structure']:
+        initial_structure = ase.io.read(config['initial_structure'], index=0, format='xyz')
+    else:
+        initial_structure = ase.Atoms()
+
     training_envs = SimpleEnvContainer([
-        MolecularEnvironment(
+        RefillableMolecularEnvironment(
             reward=reward,
             observation_space=observation_space,
             action_space=action_space,
             formulas=[util.string_to_formula(f) for f in train_formulas],
+            initial_structure=initial_structure,
+            num_refills=config['num_refills'],
             min_atomic_distance=config['min_atomic_distance'],
             max_solo_distance=config['max_solo_distance'],
             min_reward=config['min_reward'],
@@ -82,11 +95,13 @@ def main() -> None:
     ])
 
     eval_envs = SimpleEnvContainer([
-        MolecularEnvironment(
+        RefillableMolecularEnvironment(
             reward=reward,
             observation_space=observation_space,
             action_space=action_space,
             formulas=[util.string_to_formula(f) for f in eval_formulas],
+            initial_structure=initial_structure,
+            num_refills=config['num_refills'],
             min_atomic_distance=config['min_atomic_distance'],
             max_solo_distance=config['max_solo_distance'],
             min_reward=config['min_reward'],

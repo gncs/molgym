@@ -97,11 +97,11 @@ def position_point(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, distance: flo
 
 
 def position_atom_helper(
-        positions: List[np.ndarray],
-        focus: int,
-        distance: float,
-        angle: float,
-        dihedral: float,
+    positions: List[np.ndarray],
+    focus: int,
+    distance: float,
+    angle: float,
+    dihedral: float,
 ) -> np.ndarray:
     if focus > len(positions):
         raise RuntimeError('Focus greater than number of atoms')

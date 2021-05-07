@@ -9,7 +9,7 @@ import pandas as pd
 from molgym.tools.analysis import parse_json_lines_file, parse_results_filename, collect_results_paths
 
 # Styling
-fig_width = 3.3
+fig_width = 0.45 * 5.50107
 fig_height = 2.1
 
 plt.style.use('ggplot')
@@ -30,11 +30,12 @@ colors = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Analyse MolGym Output')
+    parser = argparse.ArgumentParser(description='Plot MolGym output')
 
     parser.add_argument('--dir', help='path to results directory (repeatable)', required=True, action='append')
     parser.add_argument('--baseline', help='baseline (repeatable)', required=False, action='append')
-    parser.add_argument('--max_num_steps', help='plot up to maximum number of steps', required=False, type=int)
+    parser.add_argument('--max_num_steps', help='analyse up to maximum number of steps', required=False, type=int)
+    parser.add_argument('--min_num_steps', help='analyse after minimum number of steps', required=False, type=int)
     parser.add_argument('--mode',
                         help='train or eval mode',
                         required=False,
@@ -54,8 +55,7 @@ def get_data(directories: List[str], mode: str) -> pd.DataFrame:
 
     frames = []
     for path in paths:
-        data = parse_json_lines_file(path)
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(parse_json_lines_file(path))
 
         info = parse_results_filename(os.path.basename(path))
         df['seed'] = info['seed']
@@ -72,12 +72,15 @@ def get_data(directories: List[str], mode: str) -> pd.DataFrame:
     return data
 
 
-def main():
+def main() -> None:
     args = parse_args()
     data = get_data(directories=args.dir, mode=args.mode)
 
     if args.max_num_steps:
         data = data[data['total_num_steps'] <= args.max_num_steps]
+
+    if args.min_num_steps:
+        data = data[data['total_num_steps'] >= args.min_num_steps]
 
     fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(fig_width, fig_height), constrained_layout=True)
     color_iter = iter(colors)
@@ -115,7 +118,7 @@ def main():
 
     ax.legend(loc='lower right')
 
-    fig.savefig(os.path.join(os.getcwd(), 'average_return.pdf'))
+    fig.savefig('average_return.pdf')
 
 
 if __name__ == '__main__':

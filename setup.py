@@ -1,4 +1,4 @@
-from distutils.util import convert_path
+import os
 from typing import Dict
 
 from setuptools import setup, find_packages
@@ -10,7 +10,7 @@ def readme() -> str:
 
 
 version_dict = {}  # type: Dict[str, str]
-with open(convert_path('molgym/version.py')) as file:
+with open(os.path.join('molgym', 'version.py')) as file:
     exec(file.read(), version_dict)
 
 setup(
@@ -21,11 +21,10 @@ setup(
     classifiers=['Programming Language :: Python :: 3.6'],
     author='Gregor Simm and Robert Pinsler',
     author_email='gncs2@cam.ac.uk, rp586@cam.ac.uk',
-    python_requires='>=3.6',
+    python_requires='>=3.7',
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
-        'torch',
         'gym',
         'numpy',
         'scipy',
@@ -33,7 +32,6 @@ setup(
         'matplotlib',
         'ase',
         'schnetpack',
-        'mpi4py',
     ],
     zip_safe=False,
     test_suite='pytest',

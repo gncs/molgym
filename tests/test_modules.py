@@ -38,7 +38,7 @@ class TestModules(TestCase):
 
         y1 = masked_softmax(logits=logits, mask=mask_1)
         self.assertEqual(y1.shape, (2, 2))
-        self.assertEqual(y1.sum(), 2)
+        self.assertAlmostEqual(y1.sum().item(), 2.0)
 
         mask_2 = torch.from_numpy(np.array([[1, 0], [1, 0]], dtype=np.bool))
         y2 = masked_softmax(logits=logits, mask=mask_2)

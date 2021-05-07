@@ -56,3 +56,21 @@ class TestMinimizer(TestCase):
         )
 
         self.assertFalse(success)
+
+    def test_minimize_fixed(self):
+        calculator = Sparrow('PM6')
+
+        calculator.set_elements(list(self.atoms.symbols))
+        calculator.set_positions(self.atoms.positions)
+        calculator.set_settings({'molecular_charge': self.charge, 'spin_multiplicity': self.spin_multiplicity})
+
+        fixed_index = 2
+        opt_atoms, success = minimize(
+            calculator=calculator,
+            atoms=self.atoms,
+            charge=self.charge,
+            spin_multiplicity=self.spin_multiplicity,
+            fixed_indices=[fixed_index],
+        )
+
+        self.assertTrue(np.all((self.atoms.positions - opt_atoms.positions)[fixed_index] < 1E-6))

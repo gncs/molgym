@@ -1,26 +1,33 @@
 # The content of this file is based on: DeepRL https://github.com/ShangtongZhang/DeepRL.
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Sequence, List, Iterator
 
 import numpy as np
 import torch
-from torch.optim import Adam
+from torch.optim.optimizer import Optimizer
 
 from molgym.agents.base import AbstractActorCritic
-from molgym.buffer import PPOBuffer
-from molgym.environment import AbstractMolecularEnvironment
-from molgym.tools.mpi import mpi_avg, mpi_avg_grads, get_num_procs, mpi_sum, mpi_mean_std
-from molgym.tools.util import RolloutSaver, to_numpy, ModelIO, InfoSaver
+from molgym.buffer import DynamicPPOBuffer
+from molgym.buffer_container import PPOBufferContainer
+from molgym.env_container import VecEnv
+from molgym.tools.model_util import ModelIO
+from molgym.tools.util import RolloutSaver, to_numpy, InfoSaver, compute_gradient_norm
 
 
-def compute_loss(ac: AbstractActorCritic, data: dict, clip_ratio: float, vf_coef: float,
-                 entropy_coef: float) -> Tuple[torch.Tensor, dict]:
+def compute_loss(
+    ac: AbstractActorCritic,
+    data: dict,
+    clip_ratio: float,
+    vf_coef: float,
+    entropy_coef: float,
+    device=None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     pred = ac.step(data['obs'], data['act'])
 
-    old_logp = torch.as_tensor(data['logp'])
-    adv = torch.as_tensor(data['adv'])
-    ret = torch.as_tensor(data['ret'])
+    old_logp = torch.as_tensor(data['logp'], device=device)
+    adv = torch.as_tensor(data['adv'], device=device)
+    ret = torch.as_tensor(data['ret'], device=device)
 
     # Policy loss
     ratio = torch.exp(pred['logp'] - old_logp)
@@ -45,140 +52,192 @@ def compute_loss(ac: AbstractActorCritic, data: dict, clip_ratio: float, vf_coef
     clip_fraction = torch.as_tensor(clipped, dtype=torch.float32).mean()
 
     info = dict(
-        policy_loss=mpi_avg(to_numpy(policy_loss)).item(),
-        entropy_loss=mpi_avg(to_numpy(entropy_loss)).item(),
-        vf_loss=mpi_avg(to_numpy(vf_loss)).item(),
-        total_loss=mpi_avg(to_numpy(loss)).item(),
-        approx_kl=mpi_avg(to_numpy(approx_kl)).item(),
-        clip_fraction=mpi_avg(to_numpy(clip_fraction)).item(),
+        policy_loss=to_numpy(policy_loss).item(),
+        entropy_loss=to_numpy(entropy_loss).item(),
+        vf_loss=to_numpy(vf_loss).item(),
+        total_loss=to_numpy(loss).item(),
+        approx_kl=to_numpy(approx_kl).item(),
+        clip_fraction=to_numpy(clip_fraction).item(),
     )
 
     return loss, info
 
 
+def get_batch_generator(indices: np.ndarray, batch_size: int) -> Iterator[np.ndarray]:
+    assert len(indices.shape) == 1
+    indices = np.random.permutation(indices)
+    batches = indices[:len(indices) // batch_size * batch_size].reshape(-1, batch_size)
+    for batch in batches:
+        yield batch
+    remainder = len(indices) % batch_size
+    if remainder:
+        yield indices[-remainder:]
+
+
+def collect_data_batch(data: Dict[str, Sequence], indices: np.ndarray) -> Dict[str, Sequence]:
+    batch: Dict[str, Sequence] = {}
+    for key, value in data.items():
+        if isinstance(value, np.ndarray):
+            batch[key] = value[indices]
+        elif isinstance(value, list):
+            items = []
+            for index in indices:
+                items.append(value[index])
+            batch[key] = items
+        else:
+            ValueError(value)
+    return batch
+
+
+def compute_mean_dict(dicts: List[Dict[str, float]]) -> Dict[str, float]:
+    # Assert all dicts have the same keys
+    assert (d.keys() == dicts[0].keys() for d in dicts)
+    return {key: np.mean([d[key] for d in dicts]) for key in dicts[0].keys()}
+
+
 # Train policy with multiple steps of gradient descent
-def train(ac: AbstractActorCritic, optimizer: Adam, data: Dict[str, torch.Tensor], clip_ratio: float, target_kl: float,
-          vf_coef: float, entropy_coef: float, gradient_clip: float, max_num_steps: int) -> dict:
+def train(
+    ac: AbstractActorCritic,
+    optimizer: Optimizer,
+    data: Dict[str, Sequence],
+    mini_batch_size: int,
+    clip_ratio: float,
+    target_kl: float,
+    vf_coef: float,
+    entropy_coef: float,
+    gradient_clip: float,
+    max_num_steps: int,
+    device=None,
+) -> dict:
     infos = {}
 
     start_time = time.time()
 
-    i = -1
+    num_epochs = 0
     for i in range(max_num_steps):
-        # Compute loss
-        loss, loss_info = compute_loss(ac, data, clip_ratio=clip_ratio, vf_coef=vf_coef, entropy_coef=entropy_coef)
+        optimizer.zero_grad()
+
+        batch_infos = []
+        batch_generator = get_batch_generator(indices=np.arange(len(data['obs'])), batch_size=mini_batch_size)
+        for batch_indices in batch_generator:
+            data_batch = collect_data_batch(data, indices=batch_indices)
+            batch_loss, batch_info = compute_loss(ac,
+                                                  data=data_batch,
+                                                  clip_ratio=clip_ratio,
+                                                  vf_coef=vf_coef,
+                                                  entropy_coef=entropy_coef,
+                                                  device=device)
+
+            batch_loss.backward(retain_graph=False)  # type: ignore
+            batch_infos.append(batch_info)
+
+        loss_info = compute_mean_dict(batch_infos)
+        loss_info['grad_norm'] = compute_gradient_norm(ac.parameters())
 
         # Check KL
         if loss_info['approx_kl'] > 1.5 * target_kl:
-            logging.info(f'Early stopping at step {i} due to reaching max KL.')
+            logging.debug(f'Early stopping at step {i} for reaching max KL.')
             break
 
         # Take gradient step
-        optimizer.zero_grad()
-        loss.backward()
-        mpi_avg_grads(ac)  # average grads across MPI processes
-        # Clip gradients, just to be sure
+        logging.debug('Taking gradient step')
         torch.nn.utils.clip_grad_norm_(ac.parameters(), max_norm=gradient_clip)
         optimizer.step()
+        optimizer.zero_grad()
+
+        num_epochs += 1
 
         # Logging
-        logging.debug(f'Optimization step {i}: {loss_info}')
+        logging.debug(f'Loss {i}: {loss_info}')
         infos.update(loss_info)
 
-    infos['num_opt_steps'] = i + 1
+    infos['num_opt_steps'] = num_epochs
     infos['time'] = time.time() - start_time
+
+    if num_epochs > 0:
+        logging.info(f'Optimization: policy loss={infos["policy_loss"]:.3f}, vf loss={infos["vf_loss"]:.3f}, '
+                     f'entropy loss={infos["entropy_loss"]:.3f}, total loss={infos["total_loss"]:.3f}, '
+                     f'num steps={num_epochs}')
     return infos
 
 
-def rollout(ac: AbstractActorCritic,
-            env: AbstractMolecularEnvironment,
-            buffer: PPOBuffer,
-            num_steps: Optional[int] = None,
-            num_episodes: Optional[int] = None) -> dict:
-    assert num_steps or num_episodes
-    num_steps = num_steps if num_steps is not None else np.inf
-    num_episodes = num_episodes if num_episodes is not None else np.inf
+def batch_rollout(ac: AbstractActorCritic,
+                  envs: VecEnv,
+                  buffer_container: PPOBufferContainer,
+                  num_steps: int = None,
+                  num_episodes: int = None) -> dict:
+    assert num_steps is not None or num_episodes is not None
 
-    obs = env.reset()
+    if num_steps is not None:
+        assert num_steps % envs.get_size() == 0
+        num_iters = num_steps // envs.get_size()
+    else:
+        num_iters = np.inf
 
-    ep_returns = []
-    ep_lengths = []
-
-    ep_length = 0
-    ep_counter = 0
-    step = 0
+    if num_episodes is not None:
+        assert envs.get_size() == 1
+    else:
+        num_episodes = np.inf
 
     start_time = time.time()
 
-    while step < num_steps and ep_counter < num_episodes:
-        pred = ac.step([obs])
+    counter = 0
+    observations = envs.reset()
 
-        a = to_numpy(pred['a'][0])
-        next_obs, reward, done, _ = env.step(ac.to_action_space(action=a, observation=obs))
+    while counter < num_iters and buffer_container.get_num_episodes() < num_episodes:
+        predictions = ac.step(observations)
 
-        buffer.store(obs=obs,
-                     act=a,
-                     reward=reward,
-                     next_obs=next_obs,
-                     terminal=done,
-                     value=pred['v'].item(),
-                     logp=pred['logp'].item())
+        next_observations, rewards, terminals, _ = envs.step(predictions['actions'])
 
-        obs = next_obs
+        buffer_container.store(observations=observations,
+                               actions=to_numpy(predictions['a']),
+                               rewards=rewards,
+                               next_observations=next_observations,
+                               terminals=terminals,
+                               values=to_numpy(predictions['v']),
+                               logps=to_numpy(predictions['logp']))
 
-        step += 1
-        ep_length += 1
+        # Reset environment if state is terminal to get valid next observation
+        observations = envs.reset_if_terminal(next_observations, terminals)
 
-        last_step = step == num_steps - 1
-        if done or last_step:
-            # if trajectory didn't reach terminal state, bootstrap value target of next observation
-            if not done:
-                pred = ac.step([obs])
-                value = float(pred['v'])
-            else:
-                value = 0
+        if counter == num_iters - 1:
+            # Note: finished trajectories will not be affected by this
+            predictions = ac.step(observations)
+            buffer_container.finish_paths(to_numpy(predictions['v']))
 
-            ep_return = buffer.finish_path(value)
+        counter += 1
 
-            if done:
-                ep_returns.append(ep_return)
-                ep_lengths.append(ep_length)
-                ep_counter += 1
-
-            obs = env.reset()
-            ep_length = 0
-
-    # Compute statistics
-    return_mean, return_std = mpi_mean_std(np.asarray(ep_returns), axis=0)
-    ep_length_mean, ep_length_std = mpi_mean_std(np.asarray(ep_lengths), axis=0)
-
-    value_mean, value_std = mpi_mean_std(buffer.val_buf[:buffer.ptr], axis=0)
-    logp_mean, logp_std = mpi_mean_std(buffer.logp_buf[:buffer.ptr], axis=0)
-
-    return {
+    info = {
         'time': time.time() - start_time,
-        'num_steps': mpi_sum(np.asarray(step)).item(),
-        'return_mean': return_mean.item(),
-        'return_std': return_std.item(),
-        'value_mean': value_mean.item(),
-        'value_std': value_std.item(),
-        'logp_mean': logp_mean.item(),
-        'logp_std': logp_std.item(),
-        'episode_length_mean': ep_length_mean.item(),
-        'episode_length_std': ep_length_std.item(),
+        'return_mean': np.mean(buffer_container.episodic_returns).item(),
+        'return_std': np.std(buffer_container.episodic_returns).item(),
+        'episode_length_mean': np.mean(buffer_container.episode_lengths).item(),
+        'episode_length_std': np.std(buffer_container.episode_lengths).item(),
+    }
+
+    return info
+
+
+def compute_buffer_stats(buffer: DynamicPPOBuffer) -> Dict[str, float]:
+    return {
+        'value_mean': np.mean(buffer.val_buf).item(),
+        'value_std': np.std(buffer.val_buf).item(),
+        'logp_mean': np.mean(buffer.logp_buf).item(),
+        'logp_std': np.std(buffer.logp_buf).item(),
     }
 
 
-def ppo(
-    env: AbstractMolecularEnvironment,
-    eval_env: AbstractMolecularEnvironment,
+def batch_ppo(
+    envs: VecEnv,
+    eval_envs: VecEnv,
     ac: AbstractActorCritic,
+    optimizer: Optimizer,
     gamma=0.99,
     start_num_steps=0,
     max_num_steps=4096,
     num_steps_per_iter=200,
+    mini_batch_size=64,
     clip_ratio=0.2,
-    learning_rate=3e-4,
     vf_coef=0.5,
     entropy_coef=0.0,
     max_num_train_iters=80,
@@ -193,141 +252,128 @@ def ppo(
     save_train_rollout=False,
     save_eval_rollout=True,
     info_saver: Optional[InfoSaver] = None,
+    device=None,
 ):
     """
     Proximal Policy Optimization (by clipping), with early stopping based on approximate KL
 
     Args:
-        :param env: MolecularEnvironment for training.
-
-        :param eval_env: MolecularEnvironment for evaluation.
-
+        :param envs: VecEnv for training.
+        :param eval_envs: VecEnv for evaluation.
         :param ac: Instance of an AbstractActorCritic
-
+        :param optimizer: Optimizer to optimize agent's parameters
         :param num_steps_per_iter: Number of agent-environment interaction steps per iteration.
-
         :param start_num_steps: Initial number of steps
-
         :param max_num_steps: Maximum number of steps
-
+        :param mini_batch_size: mini batch size for loss calculation
         :param gamma: Discount factor. (Always between 0 and 1.)
-
         :param clip_ratio: Hyperparameter for clipping in the policy objective.
-            Roughly: how far can the new policy go from the old policy while 
-            still profiting (improving the objective function)? The new policy 
+            Roughly: how far can the new policy go from the old policy while
+            still profiting (improving the objective function)? The new policy
             can still go farther than the clip_ratio says, but it doesn't help
             on the objective anymore. (Usually small, 0.1 to 0.3.)
-
-        :param learning_rate: Learning rate for policy optimizer.
-
         :param vf_coef: coefficient for value function loss term
-
         :param entropy_coef: coefficient for entropy loss term
-
-        :param learning_rate: Learning rate for optimizer.
-
         :param gradient_clip: clip norm of gradients before optimization step is taken
-
         :param max_num_train_iters: Maximum number of gradient descent steps to take
             on policy loss per epoch. (Early stopping may cause optimizer to take fewer than this.)
-
         :param lam: Lambda for GAE-Lambda. (Always between 0 and 1, close to 1.)
-
         :param target_kl: Roughly what KL divergence we think is appropriate
-            between new and old policies after an update. This will get used 
+            between new and old policies after an update. This will get used
             for early stopping. (Usually small, 0.01 or 0.05.)
-
         :param eval_freq: How often to evaluate the policy
-
         :param num_eval_episodes: Number of evaluation episodes
-
         :param model_handler: Save model to file
-
         :param save_freq: How often the model is saved
-
         :param rollout_saver: Saves rollout buffers
-
         :param save_train_rollout: Save training rollout
-
         :param save_eval_rollout: Save evaluation rollout
-
         :param info_saver: Save statistics
+        :param device: device on which to run the calculations
     """
-    eval_buffer_size = 1000
-
-    # Set up experience buffer
-    local_steps_per_iter = int(num_steps_per_iter / get_num_procs())
-    buffer = PPOBuffer(int_act_dim=ac.internal_action_dim, size=local_steps_per_iter, gamma=gamma, lam=lam)
-
-    # Set up optimizers for policy and value function
-    optimizer = Adam(ac.parameters(), lr=learning_rate)
 
     # Total number of steps
     total_num_steps = start_num_steps
-    num_steps_per_iter = get_num_procs() * local_steps_per_iter
-    max_num_iterations = (max_num_steps - total_num_steps) // num_steps_per_iter
+    num_iterations = (max_num_steps - total_num_steps) // num_steps_per_iter
+
+    logging.info('Starting PPO')
 
     # Main loop
-    for iteration in range(max_num_iterations):
-        logging.info(f'Iteration: {iteration}/{max_num_iterations-1}, steps: {total_num_steps}')
+    for iteration in range(num_iterations):
+        logging.info(f'Iteration: {iteration}/{num_iterations - 1}, steps: {total_num_steps}')
 
         # Training rollout
-        rollout_info = rollout(ac=ac, env=env, buffer=buffer, num_steps=local_steps_per_iter)
+        train_container = PPOBufferContainer(size=envs.get_size(), gamma=gamma, lam=lam)
+        train_rollout = batch_rollout(ac=ac, envs=envs, buffer_container=train_container, num_steps=num_steps_per_iter)
+        logging.info(
+            f'Training rollout: return={train_rollout["return_mean"]:.3f} ({train_rollout["return_std"]:.1f}), '
+            f'episode length={train_rollout["episode_length_mean"]:.1f}')
 
-        rollout_info['iteration'] = iteration
-        rollout_info['total_num_steps'] = total_num_steps
-        logging.info('Training rollout: ' + str(rollout_info))
+        train_buffer = train_container.merge()
+
         if info_saver:
-            info_saver.save(rollout_info, name='train')
+            train_rollout['total_num_steps'] = total_num_steps
+            train_rollout.update(compute_buffer_stats(train_buffer))
+            info_saver.save(train_rollout, name='train')
 
-        # Safe training buffer
+        # Save training buffer
         if rollout_saver and save_train_rollout:
-            rollout_saver.save(buffer, num_steps=total_num_steps, info='train')
+            rollout_saver.save(train_buffer, num_steps=total_num_steps, info='train')
 
         # Obtain (standardized) data for training
-        data = buffer.get()
+        data = train_buffer.get_data()
 
         # Train policy
-        train_info = train(ac=ac,
-                           optimizer=optimizer,
-                           data=data,
-                           clip_ratio=clip_ratio,
-                           vf_coef=vf_coef,
-                           entropy_coef=entropy_coef,
-                           target_kl=target_kl,
-                           gradient_clip=gradient_clip,
-                           max_num_steps=max_num_train_iters)
+        opt_info = train(
+            ac=ac,
+            optimizer=optimizer,
+            data=data,
+            mini_batch_size=mini_batch_size,
+            clip_ratio=clip_ratio,
+            vf_coef=vf_coef,
+            entropy_coef=entropy_coef,
+            target_kl=target_kl,
+            gradient_clip=gradient_clip,
+            max_num_steps=max_num_train_iters,
+            device=device,
+        )
 
-        train_info['iteration'] = iteration
-        train_info['total_num_steps'] = total_num_steps
-        logging.info('Optimization: ' + str(train_info))
         if info_saver:
-            info_saver.save(train_info, name='opt')
+            opt_info['total_num_steps'] = total_num_steps
+            info_saver.save(opt_info, name='opt')
 
         # Update number of steps taken / trained
         total_num_steps += num_steps_per_iter
 
         # Evaluate policy
-        if (iteration % eval_freq == 0) or (iteration == max_num_iterations - 1):
-            # Create new buffer every time as it's not filled
-            eval_buffer = PPOBuffer(int_act_dim=ac.internal_action_dim, size=eval_buffer_size, gamma=gamma, lam=lam)
+        if (iteration % eval_freq == 0) or (iteration == num_iterations - 1):
+            eval_container = PPOBufferContainer(size=eval_envs.get_size(), gamma=gamma, lam=lam)
 
             with torch.no_grad():
                 ac.training = False
-                rollout_info = rollout(ac, eval_env, eval_buffer, num_episodes=num_eval_episodes)
+                eval_rollout = batch_rollout(ac,
+                                             eval_envs,
+                                             buffer_container=eval_container,
+                                             num_episodes=num_eval_episodes)
+                logging.info(
+                    f'Evaluation rollout: return={eval_rollout["return_mean"]:.3f} ({eval_rollout["return_std"]:.1f}), '
+                    f'episode length={eval_rollout["episode_length_mean"]:.1f}')
                 ac.training = True
 
+            eval_buffer = eval_container.merge()
+
             # Log information
-            rollout_info['iteration'] = iteration
-            rollout_info['total_num_steps'] = total_num_steps
-            logging.info('Evaluation rollout: ' + str(rollout_info))
             if info_saver:
-                info_saver.save(rollout_info, name='eval')
+                eval_rollout['total_num_steps'] = total_num_steps
+                eval_rollout.update(compute_buffer_stats(eval_buffer))
+                info_saver.save(eval_rollout, name='eval')
 
             # Safe evaluation buffer
             if rollout_saver and save_eval_rollout:
                 rollout_saver.save(eval_buffer, num_steps=total_num_steps, info='eval')
 
         # Save model
-        if model_handler and ((iteration % save_freq == 0) or (iteration == max_num_iterations - 1)):
+        if model_handler and ((iteration % save_freq == 0) or (iteration == num_iterations - 1)):
             model_handler.save(ac, num_steps=total_num_steps)
+
+    logging.info('Finished PPO')
