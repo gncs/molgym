@@ -13,7 +13,7 @@ ndim==0.1.4
 numpy==1.19.1
 orthopy==0.8.4
 pandas==1.1.0
-Pillow==7.2.0
+Pillow==8.1.1
 protobuf==3.12.4
 pyglet==1.5.0
 pyparsing==2.4.7
