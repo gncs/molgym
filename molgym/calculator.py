@@ -1,17 +1,14 @@
-try: # sparrow earlier than v3
-    from scine_sparrow import Calculation
-    Sparrow = Calculation
-    sparrow_v3 = False
-except:
-    import scine_utilities as su
-    import scine_sparrow
-    manager = su.core.ModuleManager()
-    sparrow_v3 = True
+# Try loading energy computation backends.
+# For each one that is successful, set its entry in `calculators`.
+
+calculators = {
+        'sparrow_v2': None,
+        'sparrow_v3': None
+}
 
 class SparrowCalc:
     """
-    Calculation object for sparrow v3 mimicking older
-    sparrow API.
+    Calculation object for sparrow v3.
     """
     def __init__(self, method):
         self.calc = manager.get('calculator', method)
@@ -29,21 +26,29 @@ class SparrowCalc:
         self.structure.positions = crd
     def set_settings(self, attr):
         """
-        molecular_charge 0
-        spin_multiplicity 1
-        spin_mode any
-        temperature 298.15
-        electronic_temperature 0.0
-        symmetry_number 1
-        self_consistence_criterion 1e-07
-        density_rmsd_criterion 1e-05
-        max_scf_iterations 100
-        scf_mixer diis
-        method_parameters
-        nddo_dipole True
+        This routine will be called with `attr`:
+
+        { 'unrestricted_calculation' : int
+          'spin_multiplicity' : int
+        }
+
+        Available attributes in self.calc.settings:
+
+            molecular_charge 0
+            spin_multiplicity 1
+            spin_mode any
+            temperature 298.15
+            electronic_temperature 0.0
+            symmetry_number 1
+            self_consistence_criterion 1e-07
+            density_rmsd_criterion 1e-05
+            max_scf_iterations 100
+            scf_mixer diis
+            method_parameters
+            nddo_dipole True
         """
-        for k,v in self.calc.settings.items():
-            print(k, v)
+        #for k,v in self.calc.settings.items():
+        #    print(k, v)
         for k, v in attr.items():
             if k == 'unrestricted_calculation':
                 if v:
@@ -59,5 +64,18 @@ class SparrowCalc:
         self.calc.structure = self.structure
         return self.calc.calculate().energy
 
-if sparrow_v3:
-    Sparrow = SparrowCalc
+try:    # try sparrow v2
+    from scine_sparrow import Calculation
+    calculators['sparrow_v2'] = Calculation
+except: # try sparrow v3
+    import scine_utilities as su
+    import scine_sparrow
+    manager = su.core.ModuleManager()
+    calculators['sparrow_v3'] = SparrowCalc
+
+# Use the first loaded backend.
+for k, v in calculators.items():
+    if v is not None:
+        calculator = k
+        Sparrow = v
+        break
