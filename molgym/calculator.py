@@ -1,18 +1,22 @@
 # Try loading energy computation backends.
 # For each one that is successful, set its entry in `calculators`.
 
-calculators = {
-        'sparrow_v2': None,
-        'sparrow_v3': None
-}
+import numpy as np
+
+calculators = {"sparrow_v2": None, "sparrow_v3": None}
+
 
 class SparrowCalc:
     """
     Calculation object for sparrow v3.
     """
+
     def __init__(self, method):
-        self.calc = manager.get('calculator', method)
-        self.calc.set_required_properties([su.Property.Energy])
+        self.calc = manager.get("calculator", method)
+        self.calc.set_required_properties([su.Property.Energy, su.Property.Gradients])
+        self.elements = None
+        self.positions = None
+
     def set_elements(self, codes):
         elems = []
         for code in codes:
@@ -20,10 +24,11 @@ class SparrowCalc:
                 code = getattr(su.ElementType, code)
             elems.append(code)
 
-        self.structure = su.AtomCollection(len(elems))
-        self.structure.elements = elems
+        self.elements = elems
+
     def set_positions(self, crd):
-        self.structure.positions = crd
+        self.positions = np.array(crd) * su.BOHR_PER_ANGSTROM
+
     def set_settings(self, attr):
         """
         This routine will be called with `attr`:
@@ -47,10 +52,10 @@ class SparrowCalc:
             method_parameters
             nddo_dipole True
         """
-        #for k,v in self.calc.settings.items():
+        # for k,v in self.calc.settings.items():
         #    print(k, v)
         for k, v in attr.items():
-            if k == 'unrestricted_calculation':
+            if k == "unrestricted_calculation":
                 if v:
                     self.calc.settings["spin_mode"] = "unrestricted"
                 else:
@@ -60,18 +65,32 @@ class SparrowCalc:
                 self.calc.settings[k] = v
             except RuntimeError as e:
                 print(f"Unable to set {k} = {v}: {e}")
+
+    def _structure(self):
+        structure = su.AtomCollection(len(self.elements))
+        structure.elements = self.elements
+        structure.positions = self.positions
+        return structure
+
     def calculate_energy(self):
-        self.calc.structure = self.structure
+        self.calc.structure = self._structure()
         return self.calc.calculate().energy
 
-try:    # try sparrow v2
+    def calculate_gradients(self):
+        self.calc.structure = self._structure()
+        return self.calc.calculate().gradients
+
+
+try:  # try sparrow v2
     from scine_sparrow import Calculation
-    calculators['sparrow_v2'] = Calculation
-except: # try sparrow v3
+
+    calculators["sparrow_v2"] = Calculation
+except:  # try sparrow v3
     import scine_utilities as su
     import scine_sparrow
+
     manager = su.core.ModuleManager()
-    calculators['sparrow_v3'] = SparrowCalc
+    calculators["sparrow_v3"] = SparrowCalc
 
 # Use the first loaded backend.
 for k, v in calculators.items():

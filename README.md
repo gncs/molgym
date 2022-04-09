@@ -20,9 +20,16 @@ https://openreview.net/forum?id=jEYKjPE1xYN
 
 Dependencies:
 * Python >= 3.7
+* [ase](https://wiki.fysik.dtu.dk/ase/)
+* [cormorant](https://github.com/risilab/cormorant)
+* [gym](https://www.gymlibrary.ml/)
+* [matplotlib](https://matplotlib.org/)
+* [pandas](https://pandas.pydata.org/)
+* [quadpy](https://github.com/sigma-py/quadpy)
+* [schnetpack](https://schnetpack.readthedocs.io)
+* [sparrow](https://github.com/qcscine/sparrow) >= 2.0.1
 * torch >= 1.5.1
 * [torch-scatter](https://github.com/rusty1s/pytorch_scatter) >= 2.0.5
-* [Sparrow 2.0.1](https://github.com/qcscine/sparrow/releases/tag/2.0.1)
 
 Install required packages and library itself:
 ```
