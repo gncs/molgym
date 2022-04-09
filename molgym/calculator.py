@@ -1,6 +1,8 @@
 # Try loading energy computation backends.
 # For each one that is successful, set its entry in `calculators`.
 
+import numpy as np
+
 calculators = {
         'sparrow_v2': None,
         'sparrow_v3': None
@@ -12,7 +14,9 @@ class SparrowCalc:
     """
     def __init__(self, method):
         self.calc = manager.get('calculator', method)
-        self.calc.set_required_properties([su.Property.Energy])
+        self.calc.set_required_properties([su.Property.Energy, su.Property.Gradients])
+        self.elements = None
+        self.positions = None
     def set_elements(self, codes):
         elems = []
         for code in codes:
@@ -20,10 +24,9 @@ class SparrowCalc:
                 code = getattr(su.ElementType, code)
             elems.append(code)
 
-        self.structure = su.AtomCollection(len(elems))
-        self.structure.elements = elems
+        self.elements = elems
     def set_positions(self, crd):
-        self.structure.positions = crd
+        self.positions = np.array(crd) * su.BOHR_PER_ANGSTROM
     def set_settings(self, attr):
         """
         This routine will be called with `attr`:
@@ -60,9 +63,17 @@ class SparrowCalc:
                 self.calc.settings[k] = v
             except RuntimeError as e:
                 print(f"Unable to set {k} = {v}: {e}")
+    def _structure(self):
+        structure = su.AtomCollection(len(self.elements))
+        structure.elements = self.elements
+        structure.positions = self.positions
+        return structure
     def calculate_energy(self):
-        self.calc.structure = self.structure
+        self.calc.structure = self._structure()
         return self.calc.calculate().energy
+    def calculate_gradients(self):
+        self.calc.structure = self._structure()
+        return self.calc.calculate().gradients
 
 try:    # try sparrow v2
     from scine_sparrow import Calculation
