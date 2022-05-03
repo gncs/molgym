@@ -41,33 +41,21 @@ pip install -e .
 
 ### Sparrow Setup
 
-1. Install the prerequisites. On Ubuntu, run 
-```shell
-sudo apt-get install cmake libeigen3-dev libboost-all-dev
+Sparrow can be installed using the *conda* package manager and is available on the *conda-forge* channel.
+To install the *conda* package manager we recommend the [miniforge](https://github.com/conda-forge/miniforge/releases) installer.
+If the *conda-forge* channel is not yet enabled, add it to your channels with
+
 ```
-2. Install [Sparrow 2.0.1](https://github.com/qcscine/sparrow/releases/tag/2.0.1):
-```shell
-git clone git@github.com:qcscine/sparrow.git
-cd sparrow
-git submodule init
-git submodule update
-mkdir build install
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=../install -DSCINE_BUILD_PYTHON_BINDINGS=ON ..
-make
-make test
-make install
-export PATH=$PATH:<sparrow directory>/install/bin
+conda config --add channels conda-forge
+conda config --set channel_priority strict
 ```
 
-**Note:** Compiling Sparrow may take a while.
+Once the `conda-forge` channel has been enabled, `scine-sparrow-python` can be installed with `conda`:
 
-3. Register python bindings:
-```shell
-export PYTHONPATH=$PYTHONPATH:<sparrow directory>/install/lib/python<version>/site-packages
-export SCINE_MODULE_PATH=<sparrow directory>/install/lib
 ```
-For troubleshooting, see the official [documentation](https://scine.ethz.ch/static/download/manuals/v2.0.1/sparrow_manual.pdf).
+conda install scine-sparrow-python
+```
+
 
 ## Usage
 
