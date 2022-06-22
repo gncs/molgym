@@ -10,7 +10,7 @@ kiwisolver==1.2.0
 matplotlib==3.3.0
 mpmath==1.1.0
 ndim==0.1.4
-numpy==1.19.1
+numpy==1.22.0
 orthopy==0.8.4
 pandas==1.1.0
 Pillow==7.2.0
